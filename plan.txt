@@ -1,0 +1,49 @@
+V1
+API → Redis → Worker → PostgreSQL
+             ↓
+          DONE
+
+        ↓
+
+V2
+Multiple workers
+        ↓
+
+V3
+Retries + exponential backoff
+        ↓
+
+V4
+Worker failure recovery / leases
+        ↓
+
+V5
+Priority queues + scheduling
+        ↓
+
+V6
+Idempotency + DLQ
+        ↓
+
+V7
+Docker + horizontal scaling
+        ↓
+
+V8
+Prometheus + Grafana
+        ↓
+
+V9
+Load testing + benchmarks
+        ↓
+
+V10
+Dashboard + polished README
+
+
+v1:
+Priority of a task:
+0 = lowest
+1 = normal
+2 = high
+
