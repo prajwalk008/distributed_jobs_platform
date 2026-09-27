@@ -17,12 +17,15 @@ int main() {
 
     std::cout << "Connected to Redis\n";
 
+    const char* db_password = std::getenv("TASKFLOW_DB_PASSWORD");
+    if (db_password == nullptr) {
+        std::cerr << "TASKFLOW_DB_PASSWORD environment variable not set\n";
+        return 1;
+    }
+
     pqxx::connection db(
-        "host=localhost "
-        "port=5432 "
-        "dbname=taskflow "
-        "user=postgres "
-        "password=qwer1234"
+        "host=localhost port=5432 dbname=taskflow user=postgres password=" +
+        std::string(db_password)
     );
 
     cout << "Connected to PostgreSQL\n";
