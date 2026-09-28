@@ -3,17 +3,75 @@
 #include <chrono>
 #include <thread>
 #include <cstdlib>
+#include <algorithm>
 #include <hiredis/hiredis.h>
 #include <pqxx/pqxx>
+
 #ifdef _WIN32
 #include <process.h>
 #define GET_PID _getpid
 #endif
 
-// Handles one already-delivered stream message, regardless of whether it
-// came from a normal XREADGROUP read or was reclaimed by the crash-recovery
-// reaper below. Keeping this in one place means a reclaimed job goes
-// through the exact same attempt-tracking / retry logic as any other job.
+// --- Backoff settings (hardcoded for now; per-job-type later) ---
+const long long BACKOFF_BASE_MS = 2000;   // delay after the 1st failure
+const long long BACKOFF_MAX_MS  = 60000;  // never wait longer than this
+
+const auto WORKER_START = std::chrono::steady_clock::now();
+
+// Milliseconds since this worker process started. Used only for log lines.
+long long sinceStartMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - WORKER_START
+    ).count();
+}
+
+// Wall-clock epoch milliseconds. Used for due times in the delayed set.
+long long nowEpochMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+// attempts_made = 1 -> BASE, 2 -> 2*BASE, 3 -> 4*BASE ... capped at MAX.
+long long computeBackoffMs(int attempts_made) {
+    int shift = std::min(std::max(attempts_made - 1, 0), 20);
+    return std::min(BACKOFF_BASE_MS * (1LL << shift), BACKOFF_MAX_MS);
+}
+
+// Moves every job whose due time has passed from the delayed sorted set
+// onto the main stream. Runs as one Lua script so it is atomic: with
+// several workers all calling this, each due job is moved exactly once.
+// Returns how many jobs were moved, or -1 on error.
+int promoteDueJobs(redisContext* context) {
+    static const char* script = R"LUA(
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+for _, job_id in ipairs(due) do
+    redis.call('XADD', KEYS[2], '*', 'job_id', job_id)
+    redis.call('ZREM', KEYS[1], job_id)
+end
+return #due
+)LUA";
+
+    redisReply* r = static_cast<redisReply*>(
+        redisCommand(
+            context,
+            "EVAL %s 2 taskflow:delayed taskflow:jobs %lld",
+            script,
+            nowEpochMs()
+        )
+    );
+
+    if (r == nullptr) {
+        return -1;
+    }
+
+    int moved = (r->type == REDIS_REPLY_INTEGER) ? static_cast<int>(r->integer) : -1;
+    freeReplyObject(r);
+    return moved;
+}
+
+// Handles one already-delivered stream message, whether it came from a
+// normal XREADGROUP read or was reclaimed by the crash-recovery reaper.
 void processMessage(redisContext* context, pqxx::connection& db, redisReply* message) {
     const char* message_id = message->element[0]->str;
 
@@ -57,7 +115,8 @@ void processMessage(redisContext* context, pqxx::connection& db, redisReply* mes
 
                 int new_attempts = attempts + 1;
 
-                std::cout << "Job type: " << type
+                std::cout << "[t=" << sinceStartMs() << "ms] "
+                          << "Job type: " << type
                           << ", payload: " << payload
                           << ", attempt " << new_attempts
                           << "/" << max_tries << "\n";
@@ -78,8 +137,7 @@ void processMessage(redisContext* context, pqxx::connection& db, redisReply* mes
                 try {
                     if (type == "email") {
                         // Temporary test hook: hang mid-execution so you can
-                        // manually kill the process and simulate a crash.
-                        // Remove once there's a real way to induce a hang.
+                        // kill the process and simulate a crash.
                         if (payload.find("crash") != std::string::npos) {
                             std::cout << "Simulating a hang (crash-test payload)... "
                                          "kill this process now to test recovery.\n";
@@ -90,8 +148,7 @@ void processMessage(redisContext* context, pqxx::connection& db, redisReply* mes
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
                         // Temporary test hook: force a failure if the payload
-                        // contains "fail", so retry logic is testable. Remove
-                        // once real job types can genuinely fail on their own.
+                        // contains "fail".
                         if (payload.find("fail") != std::string::npos) {
                             throw std::runtime_error(
                                 "Simulated failure (payload contained 'fail')"
@@ -121,29 +178,38 @@ void processMessage(redisContext* context, pqxx::connection& db, redisReply* mes
                     std::cout << "Job " << job_id << " set to COMPLETED\n";
                 }
                 else if (new_attempts < max_tries) {
+                    // Retries remain: park the job in the delayed set. The
+                    // promoter will move it onto the stream once it is due.
                     finish_txn.exec_params(
                         "UPDATE jobs SET status = 'QUEUED' WHERE id = $1",
                         job_id
                     );
                     finish_txn.commit();
 
-                    redisReply* requeue = static_cast<redisReply*>(
+                    long long delay_ms = computeBackoffMs(new_attempts);
+                    long long due_ms = nowEpochMs() + delay_ms;
+
+                    redisReply* schedule = static_cast<redisReply*>(
                         redisCommand(
                             context,
-                            "XADD taskflow:jobs * job_id %s",
+                            "ZADD taskflow:delayed %lld %s",
+                            due_ms,
                             job_id.c_str()
                         )
                     );
 
-                    if (requeue == nullptr) {
-                        std::cerr << "Failed to requeue job " << job_id << "\n";
+                    if (schedule == nullptr) {
+                        // Known gap: job is QUEUED in Postgres but was never
+                        // scheduled anywhere.
+                        std::cerr << "Failed to schedule retry for job "
+                                  << job_id << "\n";
                     } else {
-                        freeReplyObject(requeue);
+                        freeReplyObject(schedule);
                     }
 
                     std::cout << "Job " << job_id << " failed (attempt "
                               << new_attempts << "/" << max_tries
-                              << "), requeued\n";
+                              << "), retry scheduled in " << delay_ms << "ms\n";
                 }
                 else {
                     finish_txn.exec_params(
@@ -209,21 +275,23 @@ int main() {
         : "worker-" + std::to_string(GET_PID());
 
     std::cout << "Consumer name: " << consumer_name << "\n";
-
     std::cout << "Worker loop started. Waiting for jobs...\n";
 
     // --- Crash recovery (XAUTOCLAIM) settings ---
-    // How often we check the PEL for stuck messages.
     const auto REAP_CHECK_INTERVAL = std::chrono::seconds(30);
-    // How long a message must sit unACKed before we treat its worker as
-    // dead and reclaim it. 15s here is a TEST value so you don't have to
-    // wait 5+ real minutes; a real deployment would use something like
-    // 5-10 minutes, as originally discussed.
+    // TEST value; a real deployment would use several minutes.
     const int REAP_MIN_IDLE_MS = 15 * 1000;
 
     auto last_reap_check = std::chrono::steady_clock::now();
 
     while (true) {
+        // Move any retries whose backoff has elapsed onto the stream.
+        int promoted = promoteDueJobs(context);
+        if (promoted > 0) {
+            std::cout << "[t=" << sinceStartMs() << "ms] Promoter: moved "
+                      << promoted << " due retry job(s) onto the stream\n";
+        }
+
         auto now = std::chrono::steady_clock::now();
 
         if (now - last_reap_check >= REAP_CHECK_INTERVAL) {
@@ -263,7 +331,7 @@ int main() {
             redisCommand(
                 context,
                 "XREADGROUP GROUP taskflow-workers %s "
-                "COUNT 1 BLOCK 5000 STREAMS taskflow:jobs >",
+                "COUNT 1 BLOCK 1000 STREAMS taskflow:jobs >",
                 consumer_name.c_str()
             )
         );
