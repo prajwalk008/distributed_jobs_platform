@@ -1,2 +1,4 @@
 build/
 TASKFLOW_PROJECT_STATE.md
+__pycache__/
+.pytest_cache/
