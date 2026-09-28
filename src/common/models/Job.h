@@ -24,4 +24,7 @@ struct Job {
     JobStatus status;
 
     JobPriority priority;
+
+    int attempts;
+    int max_tries;
 };
