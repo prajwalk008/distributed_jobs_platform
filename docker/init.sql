@@ -14,3 +14,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     heartbeat_at TIMESTAMPTZ,
     run_at       TIMESTAMPTZ
 );
+
+-- Idempotency ledger: records that a job's real action has been delivered.
+-- A worker claims a job_id here (INSERT ... ON CONFLICT DO NOTHING) BEFORE
+-- attempting the real action, and only proceeds if the claim succeeded.
+-- The row is deleted again if that attempt genuinely fails (so a retry can
+-- really attempt delivery), and kept permanently on success -- which is
+-- what stops a later reclaim of the same job from delivering it twice.
+CREATE TABLE IF NOT EXISTS job_effects (
+    job_id     VARCHAR(100) PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    claimed_at TIMESTAMPTZ  NOT NULL DEFAULT now()
+);

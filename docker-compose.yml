@@ -1,0 +1,87 @@
+# Start everything:      docker compose up --build
+# Scale to 3 workers:    docker compose up --build --scale worker=3
+# Stop everything:       docker compose down          (add -v to also wipe the DB volume)
+#
+# Needs a .env file (see .env.example) with TASKFLOW_DB_PASSWORD set — Compose
+# loads .env automatically from the same directory as this file.
+
+services:
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # No ports: published to the host on purpose — if you still have the
+    # standalone `taskflow-redis` container from earlier in this project
+    # bound to host port 6379, publishing here too would conflict with it.
+    # This compose stack's redis only needs to be reachable by api/worker,
+    # which happens automatically over the network Compose creates for
+    # services in this file. For manual debugging: `docker compose exec
+    # redis redis-cli`.
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: taskflow
+      POSTGRES_PASSWORD: ${TASKFLOW_DB_PASSWORD:?set TASKFLOW_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, only when the volume is empty (fresh first start) — see
+      # the comment at the top of init.sql.
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # Same reasoning as redis: not published to the host, to avoid clashing
+    # with a native Postgres install already using 5432. For manual
+    # debugging: `docker compose exec postgres psql -U postgres -d taskflow`.
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      TASKFLOW_REDIS_HOST: redis
+      TASKFLOW_DB_HOST: postgres
+      TASKFLOW_DB_PASSWORD: ${TASKFLOW_DB_PASSWORD:?set TASKFLOW_DB_PASSWORD in .env}
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    environment:
+      TASKFLOW_REDIS_HOST: redis
+      TASKFLOW_DB_HOST: postgres
+      TASKFLOW_DB_PASSWORD: ${TASKFLOW_DB_PASSWORD:?set TASKFLOW_DB_PASSWORD in .env}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    # No container_name here — scaling (--scale worker=N) requires letting
+    # Compose name each replica itself, which is also what gives every
+    # replica the unique HOSTNAME the worker's consumer-name fallback relies
+    # on (see the HOSTNAME fallback added to src/worker/main.cpp).
+    #
+    # Generous stop timeout: on `docker compose stop` / `down`, Docker sends
+    # SIGTERM (which the worker's graceful-shutdown handling catches) and
+    # then waits this long before SIGKILL-ing it. This needs to comfortably
+    # exceed how long the slowest real job can take to finish, since the
+    # worker deliberately waits out its current job before exiting. 60s is a
+    # starting point for the toy jobs in this project, not a production
+    # figure.
+    stop_grace_period: 60s
+
+volumes:
+  pgdata:

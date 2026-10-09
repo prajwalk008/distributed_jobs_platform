@@ -1,5 +1,11 @@
 #include <iostream>
 #include <string>
+#include <vector>
+#include <array>
+#include <sstream>
+#include <atomic>
+#include <csignal>
+#include <cstring>
 #include <chrono>
 #include <thread>
 #include <mutex>
@@ -11,9 +17,14 @@
 #include <hiredis/hiredis.h>
 #include <pqxx/pqxx>
 
+#include "../config/Config.h"
+
 #ifdef _WIN32
 #include <process.h>
 #define GET_PID _getpid
+#else
+#include <unistd.h>
+#define GET_PID getpid
 #endif
 
 // --- Backoff settings (hardcoded for now; per-job-type later) ---
@@ -54,13 +65,164 @@ long long envMs(const char* name, long long fallback) {
     }
 }
 
-// Atomically moves every due retry from the delayed set onto the stream.
+// ---------------------------------------------------------------------------
+// Graceful shutdown.
+//   1st signal (Ctrl+C, SIGTERM from `docker stop`, Ctrl+Break on Windows):
+//       stop taking new jobs, finish the one in hand, exit with code 0.
+//   2nd signal: exit right now. The job in hand is left RUNNING and gets
+//       recovered like after a crash (reaper / sweeper).
+// ---------------------------------------------------------------------------
+std::atomic<int> g_shutdown_signals{0};
+
+void onShutdownSignal(int) {
+    // Only async-signal-safe things in here: an atomic counter and _Exit.
+    if (g_shutdown_signals.fetch_add(1) >= 1) {
+        std::_Exit(130);
+    }
+}
+
+bool stopRequested() {
+    return g_shutdown_signals.load() > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Priority classes. Each class has its own Redis stream (a stream is strictly
+// first-in-first-out, so separate streams are how priorities are expressed).
+// The jobs.priority column is 0 = low, 1 = normal, 2 = high.
+// ---------------------------------------------------------------------------
+const char* CONSUMER_GROUP = "taskflow-workers";
+const std::array<const char*, 3> CLASS_NAMES = {"high", "normal", "low"};  // class index 0,1,2
+
+std::string streamFor(int cls) {
+    return std::string("taskflow:jobs:") + CLASS_NAMES[cls];
+}
+
+int classForPriority(int priority) {
+    if (priority >= 2) return 0;   // high
+    if (priority <= 0) return 2;   // low
+    return 1;                      // normal
+}
+
+// "4,2,1" -> {4,2,1}  (high, normal, low). A weight of 0 = never take that class.
+bool parseWeights(const char* text, std::array<int, 3>& out) {
+    std::stringstream ss(text);
+    std::string part;
+    int i = 0;
+    while (std::getline(ss, part, ',')) {
+        if (i >= 3) return false;
+        try {
+            size_t used = 0;
+            int v = std::stoi(part, &used);
+            if (used != part.size() || v < 0) return false;
+            out[i++] = v;
+        }
+        catch (...) {
+            return false;
+        }
+    }
+    return i == 3;
+}
+
+// Smooth weighted round-robin. For weights 4,2,1 this yields the repeating
+// cycle  H N H L H N H  : 4 high, 2 normal, 1 low, spread out instead of
+// bursty. Classes with weight 0 never appear.
+std::vector<int> buildCycle(const std::array<int, 3>& w) {
+    int total = 0;
+    for (int x : w) total += std::max(x, 0);
+
+    std::vector<int> cycle;
+    std::array<int, 3> current = {0, 0, 0};
+    for (int step = 0; step < total; ++step) {
+        int best = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (w[i] <= 0) continue;
+            current[i] += w[i];
+            if (best == -1 || current[i] > current[best]) best = i;
+        }
+        current[best] -= total;
+        cycle.push_back(best);
+    }
+    return cycle;
+}
+
+// Creates the consumer group on every priority stream (and the streams
+// themselves) if they don't exist yet. Safe to call from many workers at once.
+bool ensureGroups(redisContext* ctx) {
+    for (int cls = 0; cls < 3; ++cls) {
+        std::string stream = streamFor(cls);
+        redisReply* r = static_cast<redisReply*>(
+            redisCommand(ctx, "XGROUP CREATE %s %s 0 MKSTREAM", stream.c_str(), CONSUMER_GROUP)
+        );
+        if (r == nullptr) {
+            std::cerr << "Redis connection failed while creating consumer groups\n";
+            return false;
+        }
+        bool bad = (r->type == REDIS_REPLY_ERROR && std::strstr(r->str, "BUSYGROUP") == nullptr);
+        if (bad) {
+            std::cerr << "XGROUP CREATE " << stream << " failed: " << r->str << "\n";
+        }
+        freeReplyObject(r);
+        if (bad) return false;
+    }
+    return true;
+}
+
+// Reads at most one message per listed class. block_ms = 0 means "don't wait".
+// Returns:  1 = messages in `out` (caller frees)   0 = nothing available
+//          -1 = Redis error reply (logged)         -2 = connection failure
+int readMessages(redisContext* ctx, const std::string& consumer,
+                 const std::vector<int>& classes, int block_ms, redisReply*& out) {
+    std::vector<std::string> args = {"XREADGROUP", "GROUP", CONSUMER_GROUP, consumer, "COUNT", "1"};
+    if (block_ms > 0) {
+        args.push_back("BLOCK");
+        args.push_back(std::to_string(block_ms));
+    }
+    args.push_back("STREAMS");
+    for (int c : classes) args.push_back(streamFor(c));
+    for (size_t i = 0; i < classes.size(); ++i) args.push_back(">");
+
+    std::vector<const char*> argv;
+    std::vector<size_t> lens;
+    for (const auto& a : args) {
+        argv.push_back(a.c_str());
+        lens.push_back(a.size());
+    }
+
+    redisReply* r = static_cast<redisReply*>(
+        redisCommandArgv(ctx, static_cast<int>(argv.size()), argv.data(), lens.data())
+    );
+
+    if (r == nullptr) {
+        return -2;
+    }
+    // An error reply (e.g. NOGROUP) comes back instantly instead of blocking;
+    // the caller must back off or the loop would spin at 100% CPU.
+    if (r->type == REDIS_REPLY_ERROR) {
+        std::cerr << "XREADGROUP error: " << r->str << " (retrying in 1s)\n";
+        freeReplyObject(r);
+        return -1;
+    }
+    if (r->type != REDIS_REPLY_ARRAY || r->elements == 0) {
+        freeReplyObject(r);
+        return 0;
+    }
+    out = r;
+    return 1;
+}
+
+// Atomically moves every due retry from the delayed set onto its stream.
+// Delayed-set members look like "<priority name>|<job id>", e.g. "high|job-...".
 int promoteDueJobs(redisContext* context) {
     static const char* script = R"LUA(
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
-for _, job_id in ipairs(due) do
-    redis.call('XADD', KEYS[2], '*', 'job_id', job_id)
-    redis.call('ZREM', KEYS[1], job_id)
+for _, member in ipairs(due) do
+    local sep = string.find(member, '|', 1, true)
+    local prio = string.sub(member, 1, sep - 1)
+    local job_id = string.sub(member, sep + 1)
+    -- The stream key is built here, so this script is for a single Redis
+    -- node (not Redis Cluster).
+    redis.call('XADD', ARGV[2] .. prio, '*', 'job_id', job_id)
+    redis.call('ZREM', KEYS[1], member)
 end
 return #due
 )LUA";
@@ -68,9 +230,10 @@ return #due
     redisReply* r = static_cast<redisReply*>(
         redisCommand(
             context,
-            "EVAL %s 2 taskflow:delayed taskflow:jobs %lld",
+            "EVAL %s 1 taskflow:delayed %lld %s",
             script,
-            nowEpochMs()
+            nowEpochMs(),
+            "taskflow:jobs:"
         )
     );
 
@@ -102,7 +265,7 @@ int sweepStaleRunningJobs(redisContext* context, pqxx::connection& db, long long
             "         OR heartbeat_at < now() - ($1::double precision * interval '1 millisecond')) "
             "  ORDER BY id LIMIT 20 FOR UPDATE SKIP LOCKED "
             ") "
-            "RETURNING id, status, attempts, max_tries",
+            "RETURNING id, status, attempts, max_tries, priority",
             stale_ms
         );
 
@@ -113,6 +276,7 @@ int sweepStaleRunningJobs(redisContext* context, pqxx::connection& db, long long
             std::string status = row[1].c_str();
             int attempts = row[2].as<int>();
             int max_tries = row[3].as<int>();
+            const char* pname = CLASS_NAMES[classForPriority(row[4].as<int>())];
 
             if (status == "QUEUED") {
                 long long delay_ms = computeBackoffMs(attempts);
@@ -120,8 +284,9 @@ int sweepStaleRunningJobs(redisContext* context, pqxx::connection& db, long long
                 redisReply* schedule = static_cast<redisReply*>(
                     redisCommand(
                         context,
-                        "ZADD taskflow:delayed %lld %s",
+                        "ZADD taskflow:delayed %lld %s|%s",
                         nowEpochMs() + delay_ms,
+                        pname,
                         id.c_str()
                     )
                 );
@@ -139,6 +304,16 @@ int sweepStaleRunningJobs(redisContext* context, pqxx::connection& db, long long
             } else {
                 std::cout << "Sweeper: " << id << " was stuck RUNNING and is out of tries ("
                           << attempts << "/" << max_tries << "), marked FAILED\n";
+
+                redisReply* dlq = static_cast<redisReply*>(
+                    redisCommand(context, "XADD taskflow:dlq * job_id %s", id.c_str())
+                );
+                if (dlq == nullptr) {
+                    std::cerr << "Failed to record job " << id
+                              << " in the dead letter queue\n";
+                } else {
+                    freeReplyObject(dlq);
+                }
             }
         }
 
@@ -160,10 +335,10 @@ class LeaseHeartbeat {
 public:
     LeaseHeartbeat(std::string consumer,
                    std::chrono::milliseconds interval,
-                   std::string conninfo)
+                   config::Settings settings)
         : consumer_(std::move(consumer)),
           interval_(interval),
-          conninfo_(std::move(conninfo)) {}
+          settings_(std::move(settings)) {}
 
     ~LeaseHeartbeat() {
         {
@@ -180,13 +355,15 @@ public:
     }
 
     bool start() {
-        ctx_ = redisConnect("127.0.0.1", 6379);
-        if (ctx_ == nullptr || ctx_->err) {
+        std::string error;
+        ctx_ = config::connectRedis(settings_, error);
+        if (ctx_ == nullptr) {
+            std::cerr << "Lease heartbeat Redis connection failed: " << error << "\n";
             return false;
         }
 
         try {
-            db_ = std::make_unique<pqxx::connection>(conninfo_);
+            db_ = std::make_unique<pqxx::connection>(settings_.dbConnInfo());
         }
         catch (const std::exception& e) {
             std::cerr << "Lease heartbeat DB connection failed: " << e.what() << "\n";
@@ -198,8 +375,9 @@ public:
     }
 
     // Begin renewing the Redis claim on this message.
-    void hold(const std::string& message_id) {
+    void hold(const std::string& stream, const std::string& message_id) {
         std::lock_guard<std::mutex> lock(mu_);
+        current_stream_ = stream;
         current_id_ = message_id;
         job_id_.clear();
         attempt_ = 0;
@@ -216,6 +394,7 @@ public:
     // after release() returns.
     void release() {
         std::lock_guard<std::mutex> lock(mu_);
+        current_stream_.clear();
         current_id_.clear();
         job_id_.clear();
         attempt_ = 0;
@@ -232,26 +411,27 @@ private:
             if (current_id_.empty()) {
                 continue;
             }
-            renew(current_id_);
+            renew(current_stream_, current_id_);
         }
     }
 
     // Renews only if this consumer still owns the message, so a worker that
     // lost it can never steal it back from the worker now handling it.
-    void renew(const std::string& id) {
+    void renew(const std::string& stream, const std::string& id) {
         static const char* script = R"LUA(
-            local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
-            if #p == 0 then return 0 end
-            if p[1][2] ~= ARGV[2] then return 0 end
-            redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[3], 'JUSTID')
-            return 1
-            )LUA";
+local p = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
+if #p == 0 then return 0 end
+if p[1][2] ~= ARGV[2] then return 0 end
+redis.call('XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[3], 'JUSTID')
+return 1
+)LUA";
 
         redisReply* r = static_cast<redisReply*>(
             redisCommand(
                 ctx_,
-                "EVAL %s 1 taskflow:jobs taskflow-workers %s %s",
+                "EVAL %s 1 %s taskflow-workers %s %s",
                 script,
+                stream.c_str(),
                 consumer_.c_str(),
                 id.c_str()
             )
@@ -297,12 +477,13 @@ private:
 
     std::string consumer_;
     std::chrono::milliseconds interval_;
-    std::string conninfo_;
+    config::Settings settings_;
     redisContext* ctx_ = nullptr;
     std::unique_ptr<pqxx::connection> db_;
     std::thread thread_;
     std::mutex mu_;
     std::condition_variable cv_;
+    std::string current_stream_;
     std::string current_id_;
     std::string job_id_;
     int attempt_ = 0;
@@ -312,10 +493,11 @@ private:
 // Handles one already-delivered stream message, whether it came from a
 // normal XREADGROUP read or was reclaimed by the crash-recovery reaper.
 void processMessage(redisContext* context, pqxx::connection& db,
-                    LeaseHeartbeat& heartbeat, redisReply* message) {
+                    LeaseHeartbeat& heartbeat, const std::string& stream,
+                    redisReply* message) {
     const char* message_id = message->element[0]->str;
 
-    heartbeat.hold(message_id);
+    heartbeat.hold(stream, message_id);
 
     // Set to false if another worker took over this job while we ran it.
     bool owns_message = true;
@@ -351,7 +533,7 @@ void processMessage(redisContext* context, pqxx::connection& db,
                 "UPDATE jobs "
                 "SET status = 'RUNNING', attempts = attempts + 1, heartbeat_at = now() "
                 "WHERE id = $1 AND status NOT IN ('COMPLETED', 'FAILED') "
-                "RETURNING type, payload, attempts, max_tries",
+                "RETURNING type, payload, attempts, max_tries, priority",
                 job_id
             );
 
@@ -365,39 +547,83 @@ void processMessage(redisContext* context, pqxx::connection& db,
                 std::string payload = rows[0][1].c_str();
                 int my_attempt = rows[0][2].as<int>();
                 int max_tries = rows[0][3].as<int>();
+                const std::string pname = CLASS_NAMES[classForPriority(rows[0][4].as<int>())];
 
                 heartbeat.attach(job_id, my_attempt);
 
                 std::cout << "[t=" << sinceStartMs() << "ms] "
                           << "Job type: " << type
                           << ", payload: " << payload
+                          << ", priority: " << pname
                           << ", attempt " << my_attempt
                           << "/" << max_tries << "\n";
 
                 std::cout << "Job " << job_id << " set to RUNNING\n";
 
                 bool success = true;
+                bool claimed_effect = false;
 
                 try {
                     if (type == "email") {
-                        // Temporary test hook: hang mid-execution.
-                        if (payload.find("crash") != std::string::npos) {
+                        // Temporary test hook: hang BEFORE the send, so a crash
+                        // here means nothing was ever attempted. Excludes
+                        // "crash-after-send" so the two hooks stay independent.
+                        if (payload.find("crash") != std::string::npos &&
+                            payload.find("crash-after-send") == std::string::npos) {
                             std::cout << "Simulating a hang (crash-test payload)... "
                                          "kill this process now to test recovery.\n";
                             std::this_thread::sleep_for(std::chrono::seconds(20));
                         }
 
-                        std::cout << "Simulating: sending email...\n";
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-                        // Temporary test hook: force a failure.
-                        if (payload.find("fail") != std::string::npos) {
-                            throw std::runtime_error(
-                                "Simulated failure (payload contained 'fail')"
+                        // --- Idempotency: claim the right to actually deliver,
+                        // exactly once, BEFORE attempting the real action. The
+                        // claim happens before, not after, the send so that a
+                        // crash right after a successful send still leaves
+                        // proof it happened: a later reclaim sees the claim
+                        // already taken and skips re-sending. Stated trade-off:
+                        // a crash DURING the send also leaves the claim taken,
+                        // so that case is treated as "maybe delivered, don't
+                        // retry" rather than risking a duplicate — the same
+                        // choice real payment/notification systems make when
+                        // in doubt.
+                        {
+                            pqxx::work claim_txn(db);
+                            pqxx::result claim_rows = claim_txn.exec_params(
+                                "INSERT INTO job_effects (job_id) VALUES ($1) "
+                                "ON CONFLICT (job_id) DO NOTHING RETURNING job_id",
+                                job_id
                             );
+                            claim_txn.commit();
+                            claimed_effect = !claim_rows.empty();
                         }
 
-                        std::cout << "Email 'sent' (simulated)\n";
+                        if (!claimed_effect) {
+                            std::cout << "Job " << job_id
+                                      << ": effect already delivered, skipping duplicate send\n";
+                        } else {
+                            std::cout << "Simulating: sending email...\n";
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                            // Temporary test hook: hang AFTER the send. This is
+                            // the scenario idempotency exists for — the real
+                            // action already happened, then the worker died
+                            // before it could say so.
+                            if (payload.find("crash-after-send") != std::string::npos) {
+                                std::cout << "Simulating a hang after the send "
+                                             "(crash-after-send test payload)... "
+                                             "kill this process now to test recovery.\n";
+                                std::this_thread::sleep_for(std::chrono::seconds(20));
+                            }
+
+                            // Temporary test hook: force a failure.
+                            if (payload.find("fail") != std::string::npos) {
+                                throw std::runtime_error(
+                                    "Simulated failure (payload contained 'fail')"
+                                );
+                            }
+
+                            std::cout << "Email 'sent' (simulated)\n";
+                        }
                     } else {
                         std::cout << "Unknown job type '" << type
                                   << "', nothing to execute\n";
@@ -406,6 +632,24 @@ void processMessage(redisContext* context, pqxx::connection& db,
                 catch (const std::exception& e) {
                     std::cerr << "Job execution failed: " << e.what() << "\n";
                     success = false;
+
+                    // The send did not genuinely complete, so release the
+                    // claim: a retry must be allowed to really attempt
+                    // delivery again, not be silently skipped as "already
+                    // delivered".
+                    if (claimed_effect) {
+                        try {
+                            pqxx::work release_txn(db);
+                            release_txn.exec_params(
+                                "DELETE FROM job_effects WHERE job_id = $1", job_id
+                            );
+                            release_txn.commit();
+                        }
+                        catch (const std::exception& release_err) {
+                            std::cerr << "Failed to release claim for job " << job_id
+                                      << ": " << release_err.what() << "\n";
+                        }
+                    }
                 }
 
                 // Fenced write: only succeeds if the job is still RUNNING
@@ -448,8 +692,9 @@ void processMessage(redisContext* context, pqxx::connection& db,
                         redisReply* schedule = static_cast<redisReply*>(
                             redisCommand(
                                 context,
-                                "ZADD taskflow:delayed %lld %s",
+                                "ZADD taskflow:delayed %lld %s|%s",
                                 due_ms,
+                                pname.c_str(),
                                 job_id.c_str()
                             )
                         );
@@ -474,6 +719,20 @@ void processMessage(redisContext* context, pqxx::connection& db,
                                   << " permanently FAILED after "
                                   << my_attempt << "/" << max_tries
                                   << " attempts\n";
+
+                        redisReply* dlq = static_cast<redisReply*>(
+                            redisCommand(
+                                context,
+                                "XADD taskflow:dlq * job_id %s",
+                                job_id.c_str()
+                            )
+                        );
+                        if (dlq == nullptr) {
+                            std::cerr << "Failed to record job " << job_id
+                                      << " in the dead letter queue\n";
+                        } else {
+                            freeReplyObject(dlq);
+                        }
                     } else {
                         logLost();
                     }
@@ -497,7 +756,8 @@ void processMessage(redisContext* context, pqxx::connection& db,
     redisReply* ack = static_cast<redisReply*>(
         redisCommand(
             context,
-            "XACK taskflow:jobs taskflow-workers %s",
+            "XACK %s taskflow-workers %s",
+            stream.c_str(),
             message_id
         )
     );
@@ -511,36 +771,94 @@ void processMessage(redisContext* context, pqxx::connection& db,
 }
 
 int main() {
+    // Flush after every log line. Without this, output piped to another
+    // process (the test suite, `docker logs`, a file) sits in a buffer.
     std::cout << std::unitbuf;
-    redisContext* context = redisConnect("127.0.0.1", 6379);
 
-    if (context == nullptr || context->err) {
-        std::cerr << "Redis connection failed\n";
+    std::signal(SIGINT, onShutdownSignal);
+    std::signal(SIGTERM, onShutdownSignal);
+#ifdef SIGBREAK
+    std::signal(SIGBREAK, onShutdownSignal);  // Ctrl+Break / closing the console (Windows)
+#endif
+
+    config::Settings settings;
+    try {
+        settings = config::load();
+    }
+    catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "Connected to Redis\n";
+    std::string redis_error;
+    redisContext* context = config::connectRedis(settings, redis_error);
 
-    const char* db_password = std::getenv("TASKFLOW_DB_PASSWORD");
-    if (db_password == nullptr) {
-        std::cerr << "TASKFLOW_DB_PASSWORD environment variable not set\n";
+    if (context == nullptr) {
+        std::cerr << "Redis connection failed: " << redis_error << "\n";
         return 1;
     }
 
-    const std::string conninfo =
-        "host=localhost port=5432 dbname=taskflow user=postgres password=" +
-        std::string(db_password);
+    std::cout << "Connected to Redis (" << settings.redis_host << ":" << settings.redis_port
+              << ", db " << settings.redis_db << ")\n";
 
-    pqxx::connection db(conninfo);
+    std::unique_ptr<pqxx::connection> db_holder;
+    try {
+        db_holder = std::make_unique<pqxx::connection>(settings.dbConnInfo());
+    }
+    catch (const std::exception& e) {
+        std::cerr << "PostgreSQL connection failed: " << e.what() << "\n";
+        return 1;
+    }
+    pqxx::connection& db = *db_holder;
 
-    std::cout << "Connected to PostgreSQL\n";
+    std::cout << "Connected to PostgreSQL (" << settings.db_host << ":" << settings.db_port
+              << ", database " << settings.db_name << ")\n";
 
     const char* name_env = std::getenv("TASKFLOW_WORKER_NAME");
-    std::string consumer_name = name_env != nullptr
-        ? std::string(name_env)
-        : "worker-" + std::to_string(GET_PID());
+    std::string consumer_name;
+    if (name_env != nullptr) {
+        consumer_name = name_env;
+    } else if (const char* hostname_env = std::getenv("HOSTNAME")) {
+        // Docker gives every container a unique hostname automatically,
+        // including each replica under `docker compose up --scale`. PID
+        // alone isn't safe here: a container's main process is almost
+        // always PID 1, so every scaled worker would otherwise generate the
+        // *same* fallback name and collide as one Redis consumer.
+        consumer_name = "worker-" + std::string(hostname_env);
+    } else {
+        consumer_name = "worker-" + std::to_string(GET_PID());
+    }
 
     std::cout << "Consumer name: " << consumer_name << "\n";
+
+    // --- Priority weights: how often each class gets a turn ---
+    // TASKFLOW_WEIGHTS="high,normal,low", default 4,2,1. A 0 means this worker
+    // never takes that class (e.g. "0,0,1" = a worker dedicated to low jobs).
+    std::array<int, 3> weights = {4, 2, 1};
+    const char* weights_env = std::getenv("TASKFLOW_WEIGHTS");
+    if (weights_env != nullptr && !parseWeights(weights_env, weights)) {
+        std::cerr << "TASKFLOW_WEIGHTS must look like \"4,2,1\" (high,normal,low; "
+                     "non-negative integers), got \"" << weights_env << "\"\n";
+        return 1;
+    }
+
+    const std::vector<int> cycle = buildCycle(weights);
+    if (cycle.empty()) {
+        std::cerr << "All priority weights are 0: this worker would never take a job\n";
+        return 1;
+    }
+
+    std::vector<int> allowed;  // classes this worker may take
+    for (int cls = 0; cls < 3; ++cls) {
+        if (weights[cls] > 0) allowed.push_back(cls);
+    }
+
+    std::cout << "Priority weights: high=" << weights[0] << " normal=" << weights[1]
+              << " low=" << weights[2] << "\n";
+
+    if (!ensureGroups(context)) {
+        return 1;
+    }
 
     // --- Failure-recovery timing ---
     // With a lease, live workers keep renewing, so the idle timeout only has
@@ -563,7 +881,7 @@ int main() {
     LeaseHeartbeat heartbeat(
         consumer_name,
         std::chrono::milliseconds(REAP_IDLE_MS / 3),
-        conninfo
+        settings
     );
 
     if (!heartbeat.start()) {
@@ -576,11 +894,20 @@ int main() {
     const auto REAP_CHECK_INTERVAL = std::chrono::milliseconds(REAP_CHECK_MS);
     auto last_reap_check = std::chrono::steady_clock::now();
 
+    size_t pos = 0;  // where in the weighted cycle we are
+    int exit_code = 0;
+
     while (true) {
+        // Checked once per pass, so a job already in hand is always finished.
+        if (stopRequested()) {
+            std::cout << "Shutdown requested: not taking new jobs.\n";
+            break;
+        }
+
         int promoted = promoteDueJobs(context);
         if (promoted > 0) {
             std::cout << "[t=" << sinceStartMs() << "ms] Promoter: moved "
-                      << promoted << " due retry job(s) onto the stream\n";
+                      << promoted << " due retry job(s) onto their streams\n";
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -588,82 +915,111 @@ int main() {
         if (now - last_reap_check >= REAP_CHECK_INTERVAL) {
             last_reap_check = now;
 
-            // 1) Redis reaper: reclaim messages whose worker stopped renewing.
-            redisReply* claim_reply = static_cast<redisReply*>(
-                redisCommand(
-                    context,
-                    "XAUTOCLAIM taskflow:jobs taskflow-workers %s %lld 0",
-                    consumer_name.c_str(),
-                    REAP_IDLE_MS
-                )
-            );
+            // 1) Redis reaper: for each class this worker serves, reclaim
+            //    messages whose worker stopped renewing.
+            for (int cls : allowed) {
+                if (stopRequested()) break;
+                std::string stream = streamFor(cls);
 
-            if (claim_reply != nullptr &&
-                claim_reply->type == REDIS_REPLY_ARRAY &&
-                claim_reply->elements >= 2) {
+                redisReply* claim_reply = static_cast<redisReply*>(
+                    redisCommand(
+                        context,
+                        "XAUTOCLAIM %s taskflow-workers %s %lld 0",
+                        stream.c_str(),
+                        consumer_name.c_str(),
+                        REAP_IDLE_MS
+                    )
+                );
 
-                redisReply* claimed = claim_reply->element[1];
+                if (claim_reply != nullptr &&
+                    claim_reply->type == REDIS_REPLY_ARRAY &&
+                    claim_reply->elements >= 2) {
 
-                if (claimed->elements > 0) {
-                    std::cout << "Reaper: reclaimed " << claimed->elements
-                              << " stuck message(s)\n";
+                    redisReply* claimed = claim_reply->element[1];
 
-                    for (size_t m = 0; m < claimed->elements; ++m) {
-                        processMessage(context, db, heartbeat, claimed->element[m]);
+                    if (claimed->elements > 0) {
+                        std::cout << "Reaper: reclaimed " << claimed->elements
+                                  << " stuck message(s) from " << stream << "\n";
+
+                        for (size_t m = 0; m < claimed->elements; ++m) {
+                            // Anything left over stays claimed by us, and another
+                            // worker's reaper picks it up after the idle timeout.
+                            if (stopRequested()) break;
+                            processMessage(context, db, heartbeat, stream, claimed->element[m]);
+                        }
                     }
                 }
-            }
 
-            if (claim_reply != nullptr) {
-                freeReplyObject(claim_reply);
+                if (claim_reply != nullptr) {
+                    freeReplyObject(claim_reply);
+                }
             }
 
             // 2) Postgres sweeper: recover RUNNING rows Redis can't help with.
             sweepStaleRunningJobs(context, db, SWEEP_STALE_MS);
         }
 
-        redisReply* reply = static_cast<redisReply*>(
-            redisCommand(
-                context,
-                "XREADGROUP GROUP taskflow-workers %s "
-                "COUNT 1 BLOCK 1000 STREAMS taskflow:jobs >",
-                consumer_name.c_str()
-            )
-        );
+        redisReply* reply = nullptr;
+        int status = 0;
 
-        if (reply == nullptr) {
-            std::cerr << "Redis command failed (connection issue). Stopping worker.\n";
-            break;
+        // Pass 1: walk the weighted cycle from where we left off and take a
+        // job from the first class that has one waiting. Empty classes are
+        // skipped, so no capacity is wasted.
+        std::array<bool, 3> tried = {false, false, false};
+        size_t taken_at = 0;
+        for (size_t k = 0; k < cycle.size(); ++k) {
+            size_t idx = (pos + k) % cycle.size();
+            int cls = cycle[idx];
+            if (tried[cls]) continue;
+            tried[cls] = true;
+
+            status = readMessages(context, consumer_name, {cls}, 0, reply);
+            if (status != 0) {
+                taken_at = idx;
+                break;
+            }
         }
 
-        // An error reply (e.g. NOGROUP because the consumer group is gone)
-        // comes back instantly instead of blocking. Without this check the
-        // loop below would spin at 100% CPU, hammering Redis.
-        if (reply->type == REDIS_REPLY_ERROR) {
-            std::cerr << "XREADGROUP error: " << reply->str
-                      << " (retrying in 1s)\n";
-            freeReplyObject(reply);
+        if (status == 1) {
+            pos = (taken_at + 1) % cycle.size();
+        }
+        else if (status == 0) {
+            // Pass 2: nothing is waiting anywhere. Block until a job arrives
+            // in any class we serve (up to 1s, so the promoter and reaper
+            // keep running).
+            status = readMessages(context, consumer_name, allowed, 1000, reply);
+        }
+
+        if (status == -2) {
+            std::cerr << "Redis command failed (connection issue). Stopping worker.\n";
+            exit_code = 1;
+            break;
+        }
+        if (status == -1) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
-
-        if (reply->elements == 0) {
-            freeReplyObject(reply);
+        if (status == 0) {
             continue;
         }
 
         for (size_t i = 0; i < reply->elements; ++i) {
-            redisReply* stream = reply->element[i];
-            redisReply* messages = stream->element[1];
+            redisReply* stream_reply = reply->element[i];
+            std::string stream_name = stream_reply->element[0]->str;
+            redisReply* messages = stream_reply->element[1];
 
             for (size_t j = 0; j < messages->elements; ++j) {
-                processMessage(context, db, heartbeat, messages->element[j]);
+                processMessage(context, db, heartbeat, stream_name, messages->element[j]);
             }
         }
 
         freeReplyObject(reply);
     }
 
+    if (stopRequested()) {
+        std::cout << "Worker stopped cleanly.\n";
+    }
+
     redisFree(context);
-    return 0;
+    return exit_code;
 }
